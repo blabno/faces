@@ -16,11 +16,8 @@
  */
 package org.jboss.seam.faces.component;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-
+import javax.el.ValueExpression;
+import javax.el.ValueReference;
 import javax.faces.FacesException;
 import javax.faces.application.FacesMessage;
 import javax.faces.component.EditableValueHolder;
@@ -38,6 +35,17 @@ import javax.validation.Validation;
 import javax.validation.ValidationException;
 import javax.validation.Validator;
 import javax.validation.ValidatorFactory;
+import javax.validation.constraints.NotNull;
+import javax.validation.groups.Default;
+import javax.validation.metadata.BeanDescriptor;
+import javax.validation.metadata.ConstraintDescriptor;
+import javax.validation.metadata.PropertyDescriptor;
+import java.io.IOException;
+import java.lang.annotation.ElementType;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
 
 /**
  * <strong>UIInputContainer</strong> is a supplemental component for a JSF 2.0 composite component encapsulating one or more
@@ -45,7 +53,7 @@ import javax.validation.ValidatorFactory;
  * and a label (<strong>HtmlOutputLabel</strong>). This component takes care of wiring the label to the first input and the
  * messages to each input in sequence. It also assigns two implicit attribute values, "required" and "invalid" to indicate that
  * a required input field is present and whether there are any validation errors, respectively. To determine if a input field is
- * required, both the required attribute is consulted. Finally, if the
+ * required, both the required attribute is consulted and whether the property has Bean Validation constraints. Finally, if the
  * "label" attribute is not provided on the composite component, the label value will be derived from the id of the composite
  * component, for convenience.
  * <p/>
@@ -53,7 +61,7 @@ import javax.validation.ValidatorFactory;
  * Composite component definition example (minus layout):
  * </p>
  * <p/>
- * 
+ * <p/>
  * <pre>
  * &lt;cc:interface componentType="org.jboss.seam.faces.InputContainer"/>
  * &lt;cc:implementation>
@@ -69,7 +77,7 @@ import javax.validation.ValidatorFactory;
  * Composite component usage example:
  * </p>
  * <p/>
- * 
+ * <p/>
  * <pre>
  * &lt;example:inputContainer id="name">
  *   &lt;h:inputText id="input" value="#{person.name}"/>
@@ -89,7 +97,7 @@ import javax.validation.ValidatorFactory;
  * web.xml) keyed to javax.faces.SEPARATOR_CHAR. We recommend that you override this setting to make the separator an underscore
  * (_).
  * </p>
- * 
+ *
  * @author Dan Allen
  * @author <a href="http://community.jboss.org/people/spinner)">Jose Rodolfo freitas</a>
  */
@@ -188,9 +196,14 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
 
         if (elements.hasValidationError()) {
             getAttributes().put(getInvalidAttributeName(), true);
+        } else {
+            getAttributes().put(getInvalidAttributeName(), false);
         }
 
-        getAttributes().put(getRequiredAttributeName(), elements.hasRequiredInput());
+        // set the required attribute, but only if the user didn't already assign it
+        if (!getAttributes().containsKey(getRequiredAttributeName()) && elements.hasRequiredInput()) {
+            getAttributes().put(getRequiredAttributeName(), true);
+        }
 
         /*
          * for some reason, Mojarra is not filling Attribute Map with "label" key if label attr has an EL value, so I added a
@@ -244,7 +257,7 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
 
     /**
      * Walk the component tree branch built by the composite component and locate the input container elements.
-     * 
+     *
      * @return a composite object of the input container elements
      */
     protected InputContainerElements scan(final UIComponent component, InputContainerElements elements,
@@ -348,10 +361,10 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
     }
 
     private boolean labelHasEmptyValue(InputContainerElements elements) {
-        if (elements.getLabel() == null || elements.getLabel().getValue() == null)
+        if (elements.getLabel() == null || elements.getLabel().getValue() == null) {
             return false;
-        return (elements.getLabel().getValue().toString().trim().equals(":") || elements.getLabel().getValue().toString()
-                .trim().equals(""));
+        }
+        return (elements.getLabel().getValue().toString().trim().equals(":") || elements.getLabel().getValue().toString().trim().equals(""));
     }
 
     public static class InputContainerElements {
@@ -359,6 +372,7 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
         private HtmlOutputLabel label;
         private final List<EditableValueHolder> inputs = new ArrayList<EditableValueHolder>();
         private final List<UIMessage> messages = new ArrayList<UIMessage>();
+        private boolean requiredInput = false;
         private boolean validationError = false;
 
         public HtmlOutputLabel getLabel() {
@@ -375,7 +389,9 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
 
         public void registerInput(final EditableValueHolder input, final Validator validator, final FacesContext context) {
             inputs.add(input);
-            
+            if (input.isRequired() || isRequiredByConstraint(input, validator, context)) {
+                requiredInput = true;
+            }
             if (!input.isValid()) {
                 validationError = true;
             }
@@ -404,13 +420,7 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
         }
 
         public boolean hasRequiredInput() {
-            //We have to scan these each time as the value could change in an AJAX request
-            for (EditableValueHolder holder : inputs) {
-                if (holder.isRequired()) {
-                    return true;
-                }
-            }
-            return false;
+            return requiredInput;
         }
 
         public String getPropertyName(final FacesContext context) {
@@ -439,6 +449,37 @@ public class UIInputContainer extends UIComponentBase implements NamingContainer
                     }
                 }
             }
+        }
+
+        private boolean isRequiredByConstraint(final EditableValueHolder input, final Validator validator, final FacesContext context) {
+            if (validator == null) {
+                return false;
+            }
+
+            // NOTE believe it or not, getValueReference on ValueExpression is broken, so we have to do it ourselves
+            ValueExpression valueExpression = ((UIComponent) input).getValueExpression("value");
+            if (valueExpression != null) {
+                ValueExpressionAnalyzer valueExpressionAnalyzer = new ValueExpressionAnalyzer(valueExpression);
+                ValueReference vref = valueExpressionAnalyzer.getValueReference(context.getELContext());
+                if (vref != null) { // valueExpressionAnalyzer can return a null value. The condition prevents a NPE
+                    BeanDescriptor constraintsForClass = validator.getConstraintsForClass(vref.getBase().getClass());
+                    PropertyDescriptor d = constraintsForClass.getConstraintsForProperty((String) vref.getProperty());
+                    if (d != null) {
+                        //checking property's constraints in search for NotNull annotation
+                        final Set<ConstraintDescriptor<?>> constraints = d.findConstraints()
+                            .declaredOn(ElementType.FIELD)
+                            .unorderedAndMatchingGroups(Default.class)
+                            .getConstraintDescriptors();
+                        for (ConstraintDescriptor constraint : constraints) {
+                            if (constraint.getAnnotation().annotationType().equals(NotNull.class)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }
+            return false;
         }
     }
 }
